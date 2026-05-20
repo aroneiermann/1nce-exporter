@@ -61,11 +61,12 @@ func mustEnv(key string) string {
 }
 
 func parseUnixSeconds(s string) float64 {
-	t, err := time.Parse("2006-01-02 15:04:05", s)
-	if err != nil {
-		return 0
+	for _, layout := range []string{"2006-01-02 15:04:05", time.RFC3339, time.RFC3339Nano} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return float64(t.Unix())
+		}
 	}
-	return float64(t.Unix())
+	return 0
 }
 
 func load_configuration() {
@@ -133,7 +134,7 @@ func fetchSimCards(ctx context.Context) {
 	headers := map[string]string{
 		"accept":        "application/json",
 		"authorization": fmt.Sprintf("Bearer %s", exporterState.auth.token)}
-	body := onceAPIFetch("GET", "https://api.1nce.com/management-api/v1/sims", headers, nil)
+	body := onceAPIFetch("GET", "https://api.1nce.com/management-api/v1/sims?pageSize=100", headers, nil)
 
 	var apiResponse OnceApiManagementSims
 	err := json.Unmarshal(body, &apiResponse)
@@ -142,8 +143,9 @@ func fetchSimCards(ctx context.Context) {
 	}
 
 	for _, simcard := range apiResponse {
-		updateSimCardStatus(ctx, simcard.Iccid)
+		updateSimCardStatus(ctx, simcard.Iccid, simcard.Label, simcard.Status)
 		updateSimCardDataQuota(ctx, simcard.Iccid)
+		updateSimCardPosition(ctx, simcard.Iccid)
 
 		imeiLockVal := 0.0
 		if simcard.ImeiLock {
@@ -157,7 +159,25 @@ func fetchSimCards(ctx context.Context) {
 	}
 }
 
-func updateSimCardStatus(ctx context.Context, iccid string) {
+func activationStatusValue(status string) float64 {
+	if status == "Enabled" {
+		return 1
+	}
+	return 0
+}
+
+func sessionStatusValue(status string) float64 {
+	switch status {
+	case "ONLINE":
+		return 2
+	case "ATTACHED":
+		return 1
+	default:
+		return 0
+	}
+}
+
+func updateSimCardStatus(ctx context.Context, iccid, label, activationStatus string) {
 	type OnceApiManagementSimCardStatus struct {
 		Status   string `json:"status"`
 		Location struct {
@@ -241,16 +261,70 @@ func updateSimCardStatus(ctx context.Context, iccid string) {
 	}
 
 	loc := apiResponse.Location
+	log.Printf("[%s] status=%s operator=%s ip=%s last_contact=%s last_gprs=%s",
+		iccid, apiResponse.Status,
+		loc.Operator.Name,
+		apiResponse.PdpContext.UeIPAddress,
+		loc.LastUpdated, loc.LastUpdatedGprs)
+
 	iccidAttr := metric.WithAttributes(attribute.String("iccid", iccid))
 
 	exporterState.gauges.info.Record(ctx, 1.0,
 		metric.WithAttributes(
 			attribute.String("iccid", iccid),
+			attribute.String("label", label),
+			attribute.String("activation_status", activationStatus),
 			attribute.String("operator", loc.Operator.Name),
 			attribute.String("ip", apiResponse.PdpContext.UeIPAddress),
 		))
+	exporterState.gauges.sessionStatus.Record(ctx, sessionStatusValue(apiResponse.Status), iccidAttr)
+	exporterState.gauges.activationStatus.Record(ctx, activationStatusValue(activationStatus), iccidAttr)
 	exporterState.gauges.lastContact.Record(ctx, parseUnixSeconds(loc.LastUpdated), iccidAttr)
 	exporterState.gauges.lastGprs.Record(ctx, parseUnixSeconds(loc.LastUpdatedGprs), iccidAttr)
+}
+
+func updateSimCardPosition(ctx context.Context, iccid string) {
+	type PositionEntry struct {
+		SampleTime string     `json:"sampleTime"`
+		Coordinate [2]float64 `json:"coordinate"` // [longitude, latitude] — GeoJSON order
+		Source     string     `json:"source"`
+	}
+	type PositionResponse struct {
+		Coordinates []PositionEntry `json:"coordinates"`
+	}
+
+	headers := map[string]string{
+		"accept":        "application/json",
+		"authorization": fmt.Sprintf("Bearer %s", exporterState.auth.token)}
+	body := onceAPIFetch("GET", fmt.Sprintf("https://api.1nce.com/management-api/v1/locate/devices/%s/positions", iccid), headers, nil)
+	if body == nil {
+		return
+	}
+
+	var resp PositionResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		log.Printf("[%s] position decode error: %v — raw: %s", iccid, err, body)
+		return
+	}
+	if len(resp.Coordinates) == 0 {
+		return
+	}
+
+	pos := resp.Coordinates[0]
+	for _, c := range resp.Coordinates[1:] {
+		if parseUnixSeconds(c.SampleTime) > parseUnixSeconds(pos.SampleTime) {
+			pos = c
+		}
+	}
+	lon, lat := pos.Coordinate[0], pos.Coordinate[1]
+
+	attrs := metric.WithAttributes(attribute.String("iccid", iccid))
+	exporterState.gauges.positionLatitude.Record(ctx, lat, attrs)
+	exporterState.gauges.positionLongitude.Record(ctx, lon, attrs)
+	if ts := parseUnixSeconds(pos.SampleTime); ts > 0 {
+		exporterState.gauges.positionResolvedSeconds.Record(ctx, ts, attrs)
+	}
+	log.Printf("[%s] position: lat=%.5f lon=%.5f source=%s sampled=%s", iccid, lat, lon, pos.Source, pos.SampleTime)
 }
 
 func updateSimCardDataQuota(ctx context.Context, iccid string) {
@@ -371,6 +445,26 @@ func main() {
 		panic(err)
 	}
 	exporterState.gauges.lastGprs, err = meter.Float64Gauge("once_sim_card_last_gprs_seconds")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.sessionStatus, err = meter.Float64Gauge("once_sim_card_session_status")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.activationStatus, err = meter.Float64Gauge("once_sim_card_activation_status")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.positionLatitude, err = meter.Float64Gauge("once_sim_card_position_latitude")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.positionLongitude, err = meter.Float64Gauge("once_sim_card_position_longitude")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.positionResolvedSeconds, err = meter.Float64Gauge("once_sim_card_position_resolved_seconds")
 	if err != nil {
 		panic(err)
 	}
