@@ -60,6 +60,14 @@ func mustEnv(key string) string {
 	return v
 }
 
+func parseUnixSeconds(s string) float64 {
+	t, err := time.Parse("2006-01-02 15:04:05", s)
+	if err != nil {
+		return 0
+	}
+	return float64(t.Unix())
+}
+
 func load_configuration() {
 	exporterState.configuration.credentials.username = mustEnv("ONCE_USERNAME")
 	exporterState.configuration.credentials.password = mustEnv("ONCE_PASSWORD")
@@ -134,7 +142,7 @@ func fetchSimCards(ctx context.Context) {
 	}
 
 	for _, simcard := range apiResponse {
-		updateSimCardStatus(simcard.Iccid)
+		updateSimCardStatus(ctx, simcard.Iccid)
 		updateSimCardDataQuota(ctx, simcard.Iccid)
 
 		imeiLockVal := 0.0
@@ -149,7 +157,7 @@ func fetchSimCards(ctx context.Context) {
 	}
 }
 
-func updateSimCardStatus(iccid string) {
+func updateSimCardStatus(ctx context.Context, iccid string) {
 	type OnceApiManagementSimCardStatus struct {
 		Status   string `json:"status"`
 		Location struct {
@@ -232,7 +240,17 @@ func updateSimCardStatus(iccid string) {
 		log.Printf("JSON decode error: %v", err)
 	}
 
-	// ToDo: parse metrics
+	loc := apiResponse.Location
+	iccidAttr := metric.WithAttributes(attribute.String("iccid", iccid))
+
+	exporterState.gauges.info.Record(ctx, 1.0,
+		metric.WithAttributes(
+			attribute.String("iccid", iccid),
+			attribute.String("operator", loc.Operator.Name),
+			attribute.String("ip", apiResponse.PdpContext.UeIPAddress),
+		))
+	exporterState.gauges.lastContact.Record(ctx, parseUnixSeconds(loc.LastUpdated), iccidAttr)
+	exporterState.gauges.lastGprs.Record(ctx, parseUnixSeconds(loc.LastUpdatedGprs), iccidAttr)
 }
 
 func updateSimCardDataQuota(ctx context.Context, iccid string) {
@@ -256,6 +274,8 @@ func updateSimCardDataQuota(ctx context.Context, iccid string) {
 	if err != nil {
 		log.Printf("JSON decode error: %v", err)
 	}
+
+	log.Printf("[%s] quota expires: %s  last status change: %s", iccid, apiResponse.ExpiryDate, apiResponse.LastStatusChangeDate)
 
 	attrs := metric.WithAttributes(attribute.String("iccid", iccid))
 	exporterState.gauges.dataVolumeTotal.Record(ctx, float64(apiResponse.TotalVolume), attrs)
@@ -296,6 +316,7 @@ func requestBearer() {
 	}
 	exporterState.auth.token = apiResponse.AccessToken
 	exporterState.auth.expires = time.Now().Add(time.Second * time.Duration(apiResponse.ExpiresIn-10))
+	log.Printf("bearer token obtained, expires in %ds", apiResponse.ExpiresIn)
 }
 
 func checkAndRenewBearer() {
@@ -338,6 +359,18 @@ func main() {
 		panic(err)
 	}
 	exporterState.gauges.dataVolumeTotal, err = meter.Float64Gauge("once_sim_card_data_volume_total")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.info, err = meter.Float64Gauge("once_sim_card_info")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.lastContact, err = meter.Float64Gauge("once_sim_card_last_contact_seconds")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.lastGprs, err = meter.Float64Gauge("once_sim_card_last_gprs_seconds")
 	if err != nil {
 		panic(err)
 	}
