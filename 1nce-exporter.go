@@ -1,31 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"io"
+	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
-)
 
-var (
-	simCardIMEIlocked = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "once_sim_card_imei_locked",
-		Help: "IMEI lock state of a given SIM card",
-	}, []string{"iccid", "imei"})
-	simCardDataVolumeRemaining = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "once_sim_card_data_volume_remaining",
-		Help: "Remaining Data usage of a SIM card in Megabyte",
-	}, []string{"iccid"})
-	simCardDataVolumeTotal = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "once_sim_card_data_volume_total",
-		Help: "Total Data volume ever booked for a SIM card",
-	}, []string{"iccid"})
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
+	"go.opentelemetry.io/otel/metric"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 )
 
 type exporterConfiguration struct {
@@ -33,6 +24,9 @@ type exporterConfiguration struct {
 		username string
 		password string
 	}
+	otlpEndpoint string
+	otlpUsername string
+	otlpPassword string
 }
 
 type onceExporter struct {
@@ -41,31 +35,71 @@ type onceExporter struct {
 		token   string
 		expires time.Time
 	}
+	gauges struct {
+		imeiLocked              metric.Float64Gauge
+		dataVolumeRemaining     metric.Float64Gauge
+		dataVolumeTotal         metric.Float64Gauge
+		info                    metric.Float64Gauge
+		lastContact             metric.Float64Gauge
+		lastGprs                metric.Float64Gauge
+		sessionStatus           metric.Float64Gauge
+		activationStatus        metric.Float64Gauge
+		positionLatitude        metric.Float64Gauge
+		positionLongitude       metric.Float64Gauge
+		positionResolvedSeconds metric.Float64Gauge
+	}
 }
 
 var exporterState = onceExporter{}
 
-func load_configuration(filepath string) {
-	exporterState.configuration.credentials.username = "81029943_dbauerapi"
-	exporterState.configuration.credentials.password = "fnsh1nce"
+func mustEnv(key string) string {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		panic(fmt.Sprintf("required environment variable %s is not set", key))
+	}
+	return v
 }
 
-func onceAPIFetch(method string, url string, headers map[string]string, payload io.Reader) []byte {
-	req, _ := http.NewRequest(method, url, payload)
+func load_configuration() {
+	exporterState.configuration.credentials.username = mustEnv("ONCE_USERNAME")
+	exporterState.configuration.credentials.password = mustEnv("ONCE_PASSWORD")
+	exporterState.configuration.otlpEndpoint = mustEnv("OTLP_ENDPOINT")
+	exporterState.configuration.otlpUsername = mustEnv("OTLP_USERNAME")
+	exporterState.configuration.otlpPassword = mustEnv("OTLP_PASSWORD")
+}
+
+func onceAPIFetch(method string, reqURL string, headers map[string]string, payload io.Reader) []byte {
+	req, err := http.NewRequest(method, reqURL, payload)
+	if err != nil {
+		log.Printf("failed to build request %s %s: %v", method, reqURL, err)
+		return nil
+	}
 
 	for key, value := range headers {
 		req.Header.Add(key, value)
 	}
 
-	res, _ := http.DefaultClient.Do(req)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("request failed %s %s: %v", method, reqURL, err)
+		return nil
+	}
 	defer res.Body.Close()
-	fmt.Println(res.Status)
-	body, _ := io.ReadAll(res.Body)
 
+	if res.StatusCode >= 400 {
+		log.Printf("HTTP %s: %s %s", res.Status, method, reqURL)
+		return nil
+	}
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		log.Printf("failed to read response from %s %s: %v", method, reqURL, err)
+		return nil
+	}
 	return body
 }
 
-func fetchSimCards() {
+func fetchSimCards(ctx context.Context) {
 	type OnceApiManagementSims []struct {
 		Iccid          string `json:"iccid"`
 		Imsi           string `json:"imsi"`
@@ -96,17 +130,22 @@ func fetchSimCards() {
 	var apiResponse OnceApiManagementSims
 	err := json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		fmt.Println(err)
+		log.Printf("JSON decode error: %v", err)
 	}
 
 	for _, simcard := range apiResponse {
 		updateSimCardStatus(simcard.Iccid)
-		updateSimCardDataQuota(simcard.Iccid)
+		updateSimCardDataQuota(ctx, simcard.Iccid)
+
+		imeiLockVal := 0.0
 		if simcard.ImeiLock {
-			simCardIMEIlocked.WithLabelValues(simcard.Iccid, simcard.Imei).Set(1)
-		} else {
-			simCardIMEIlocked.WithLabelValues(simcard.Iccid, simcard.Imei).Set(0)
+			imeiLockVal = 1.0
 		}
+		exporterState.gauges.imeiLocked.Record(ctx, imeiLockVal,
+			metric.WithAttributes(
+				attribute.String("iccid", simcard.Iccid),
+				attribute.String("imei", simcard.Imei),
+			))
 	}
 }
 
@@ -190,13 +229,13 @@ func updateSimCardStatus(iccid string) {
 	var apiResponse OnceApiManagementSimCardStatus
 	err := json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		fmt.Println(err)
+		log.Printf("JSON decode error: %v", err)
 	}
 
 	// ToDo: parse metrics
 }
 
-func updateSimCardDataQuota(iccid string) {
+func updateSimCardDataQuota(ctx context.Context, iccid string) {
 	type SimCardDataQuote struct {
 		Volume               float64 `json:"volume"`
 		TotalVolume          int     `json:"total_volume"`
@@ -215,11 +254,12 @@ func updateSimCardDataQuota(iccid string) {
 	var apiResponse SimCardDataQuote
 	err := json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		fmt.Println(err)
+		log.Printf("JSON decode error: %v", err)
 	}
 
-	simCardDataVolumeTotal.WithLabelValues(iccid).Set(float64(apiResponse.TotalVolume))
-	simCardDataVolumeRemaining.WithLabelValues(iccid).Set(float64(apiResponse.Volume))
+	attrs := metric.WithAttributes(attribute.String("iccid", iccid))
+	exporterState.gauges.dataVolumeTotal.Record(ctx, float64(apiResponse.TotalVolume), attrs)
+	exporterState.gauges.dataVolumeRemaining.Record(ctx, apiResponse.Volume, attrs)
 }
 
 func requestBearer() {
@@ -247,10 +287,13 @@ func requestBearer() {
 
 	err := json.Unmarshal(body, &apiResponse)
 	if err != nil {
-		fmt.Println(err)
+		log.Printf("JSON decode error: %v", err)
 	}
 
-	fmt.Println(apiResponse.AccessToken)
+	if apiResponse.AccessToken == "" {
+		log.Printf("1nce bearer token request failed — check ONCE_USERNAME and ONCE_PASSWORD")
+		return
+	}
 	exporterState.auth.token = apiResponse.AccessToken
 	exporterState.auth.expires = time.Now().Add(time.Second * time.Duration(apiResponse.ExpiresIn-10))
 }
@@ -261,19 +304,62 @@ func checkAndRenewBearer() {
 	}
 }
 
-func recordMetrics() {
-	go func() {
-		for {
-			fetchSimCards()
-			time.Sleep(120 * time.Second)
-		}
-	}()
-}
-
 func main() {
-	load_configuration("")
+	load_configuration()
 	checkAndRenewBearer()
-	recordMetrics()
-	http.Handle("/metrics", promhttp.Handler())
-	http.ListenAndServe(":2112", nil)
+
+	ctx := context.Background()
+
+	otlpAuth := base64.StdEncoding.EncodeToString([]byte(
+		exporterState.configuration.otlpUsername + ":" + exporterState.configuration.otlpPassword))
+
+	exporter, err := otlpmetrichttp.New(ctx,
+		otlpmetrichttp.WithEndpointURL(exporterState.configuration.otlpEndpoint),
+		otlpmetrichttp.WithHeaders(map[string]string{
+			"Authorization": "Basic " + otlpAuth,
+		}),
+	)
+	if err != nil {
+		panic(fmt.Sprintf("cannot create OTLP exporter: %s", err))
+	}
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer provider.Shutdown(ctx)
+
+	meter := provider.Meter("1nce-exporter")
+
+	exporterState.gauges.imeiLocked, err = meter.Float64Gauge("once_sim_card_imei_locked")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.dataVolumeRemaining, err = meter.Float64Gauge("once_sim_card_data_volume_remaining")
+	if err != nil {
+		panic(err)
+	}
+	exporterState.gauges.dataVolumeTotal, err = meter.Float64Gauge("once_sim_card_data_volume_total")
+	if err != nil {
+		panic(err)
+	}
+
+	for {
+		log.Printf("fetching SIM card metrics")
+		checkAndRenewBearer()
+		fetchSimCards(ctx)
+
+		var rm metricdata.ResourceMetrics
+		if err := reader.Collect(ctx, &rm); err != nil {
+			log.Printf("metrics collect error: %v", err)
+		} else if err := exporter.Export(ctx, &rm); err != nil {
+			if strings.Contains(err.Error(), "401") {
+				log.Printf("OTLP authentication failed (check OTLP_USERNAME and OTLP_PASSWORD): %v", err)
+			} else {
+				log.Printf("OTLP push error: %v", err)
+			}
+		} else {
+			log.Printf("metrics pushed successfully to %s", exporterState.configuration.otlpEndpoint)
+		}
+
+		time.Sleep(120 * time.Second)
+	}
 }
