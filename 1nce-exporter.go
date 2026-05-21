@@ -77,33 +77,45 @@ func load_configuration() {
 	exporterState.configuration.otlpPassword = mustEnv("OTLP_PASSWORD")
 }
 
-func onceAPIFetch(method string, reqURL string, headers map[string]string, payload io.Reader) []byte {
+func doRequest(method, reqURL string, headers map[string]string, payload io.Reader) ([]byte, int) {
 	req, err := http.NewRequest(method, reqURL, payload)
 	if err != nil {
 		log.Printf("failed to build request %s %s: %v", method, reqURL, err)
-		return nil
+		return nil, 0
 	}
-
 	for key, value := range headers {
-		req.Header.Add(key, value)
+		req.Header.Set(key, value)
 	}
-
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
 		log.Printf("request failed %s %s: %v", method, reqURL, err)
-		return nil
+		return nil, 0
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode >= 400 {
-		log.Printf("HTTP %s: %s %s", res.Status, method, reqURL)
-		return nil
+		return nil, res.StatusCode
 	}
-
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		log.Printf("failed to read response from %s %s: %v", method, reqURL, err)
-		return nil
+		return nil, res.StatusCode
+	}
+	return body, res.StatusCode
+}
+
+func onceAPIFetch(method string, reqURL string, headers map[string]string, payload io.Reader) []byte {
+	body, status := doRequest(method, reqURL, headers, payload)
+	if status == 401 && strings.HasPrefix(headers["authorization"], "Bearer ") {
+		log.Printf("authentication error (401): %s %s", method, reqURL)
+		requestBearer()
+		if exporterState.auth.token != "" {
+			headers["authorization"] = fmt.Sprintf("Bearer %s", exporterState.auth.token)
+			body, status = doRequest(method, reqURL, headers, payload)
+		}
+	}
+	if status >= 400 {
+		log.Printf("HTTP %s: %s %s", http.StatusText(status), method, reqURL)
 	}
 	return body
 }
